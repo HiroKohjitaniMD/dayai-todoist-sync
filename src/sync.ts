@@ -108,11 +108,22 @@ async function getTodoistTask(
 async function getTodoistProjectTasks(
   token: string
 ): Promise<TodoistTask[]> {
-  return todoistRequest<TodoistTask[]>(
-    "GET",
-    `/tasks?project_id=${TODOIST_PROJECT_ID}`,
-    token
-  );
+  const allTasks: TodoistTask[] = [];
+  let cursor: string | null = null;
+  do {
+    const params = new URLSearchParams({
+      project_id: TODOIST_PROJECT_ID,
+      limit: "200",
+    });
+    if (cursor) params.set("cursor", cursor);
+    const page = await todoistRequest<{
+      results: TodoistTask[];
+      next_cursor: string | null;
+    }>("GET", `/tasks?${params.toString()}`, token);
+    allTasks.push(...page.results);
+    cursor = page.next_cursor;
+  } while (cursor);
+  return allTasks;
 }
 
 async function updateTodoistTaskDueDate(
