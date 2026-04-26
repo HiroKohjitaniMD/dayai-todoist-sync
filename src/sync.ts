@@ -35,6 +35,12 @@ interface TodoistTask {
   is_completed: boolean;
   checked: boolean;
   project_id: string;
+  due?: { date: string } | null;
+}
+
+function dateOnly(value: string | undefined | null): string | null {
+  if (!value) return null;
+  return value.split("T")[0];
 }
 
 // --- Todoist API helpers ---
@@ -107,6 +113,14 @@ async function getTodoistProjectTasks(
     `/tasks?project_id=${TODOIST_PROJECT_ID}`,
     token
   );
+}
+
+async function updateTodoistTaskDueDate(
+  token: string,
+  taskId: string,
+  dueDate: string
+): Promise<void> {
+  await todoistRequest("POST", `/tasks/${taskId}`, token, { due_date: dueDate });
 }
 
 // --- DayAI helpers ---
@@ -195,65 +209,111 @@ async function completeAction(
   });
 }
 
+async function updateActionDueDate(
+  client: DayAIClient,
+  actionId: string,
+  dueDate: string
+): Promise<void> {
+  await client.mcpCallTool("create_or_update_action", {
+    actionId,
+    dueDate,
+  });
+}
+
 // --- Sync Logic ---
 
 /**
  * Direction A: DayAI → Todoist
- * Find open Actions without todoist_task_id marker → create Todoist tasks
+ * Find open Actions without todoist_task_id marker → create Todoist tasks.
+ * For already-synced Actions, push timeframeEnd changes to Todoist due_date.
  */
 async function syncDayAIToTodoist(
   client: DayAIClient,
   todoistToken: string,
   openActions: DayAIAction[]
-): Promise<number> {
+): Promise<{ created: number; dueDateUpdated: number }> {
   const unsyncedActions = openActions.filter(
     (a) => !extractTodoistId(a.description)
   );
 
+  let created = 0;
   if (unsyncedActions.length === 0) {
     console.log("[A] No unsynced actions found.");
-    return 0;
-  }
-
-  console.log(`[A] Found ${unsyncedActions.length} unsynced action(s).`);
-  let synced = 0;
-
-  for (const action of unsyncedActions) {
-    try {
-      const taskId = await createTodoistTask(todoistToken, action);
-      const updatedDesc = (action.description || "").trimEnd() +
-        `\n${TODOIST_MARKER_PREFIX}${taskId}`;
-      await updateActionDescription(client, action.objectId, updatedDesc);
-      console.log(`[A] ✅ Synced: "${action.title}" → Todoist task ${taskId}`);
-      synced++;
-    } catch (err) {
-      console.error(`[A] ❌ Failed to sync "${action.title}":`, err);
+  } else {
+    console.log(`[A] Found ${unsyncedActions.length} unsynced action(s).`);
+    for (const action of unsyncedActions) {
+      try {
+        const taskId = await createTodoistTask(todoistToken, action);
+        const updatedDesc = (action.description || "").trimEnd() +
+          `\n${TODOIST_MARKER_PREFIX}${taskId}`;
+        await updateActionDescription(client, action.objectId, updatedDesc);
+        console.log(`[A] ✅ Synced: "${action.title}" → Todoist task ${taskId}`);
+        created++;
+      } catch (err) {
+        console.error(`[A] ❌ Failed to sync "${action.title}":`, err);
+      }
     }
   }
 
-  return synced;
+  // Due-date push: for synced actions, reflect DayAI timeframeEnd to Todoist
+  const syncedActions = openActions.filter(
+    (a) => extractTodoistId(a.description) !== null
+  );
+
+  let dueDateUpdated = 0;
+  if (syncedActions.length === 0) {
+    return { created, dueDateUpdated };
+  }
+
+  const todoistTasks = await getTodoistProjectTasks(todoistToken);
+  const todoistTaskMap = new Map(todoistTasks.map((t) => [t.id, t]));
+
+  for (const action of syncedActions) {
+    const taskId = extractTodoistId(action.description)!;
+    const task = todoistTaskMap.get(taskId);
+    if (!task) continue; // task may be completed/deleted; skip
+
+    const dayaiDate = dateOnly(action.timeframeEnd);
+    const todoistDate = dateOnly(task.due?.date);
+    if (dayaiDate === todoistDate) continue;
+    if (dayaiDate === null) continue; // do not clear Todoist due_date
+
+    try {
+      await updateTodoistTaskDueDate(todoistToken, taskId, dayaiDate);
+      console.log(
+        `[A] 📅 Updated Todoist due_date for "${action.title}": ${todoistDate ?? "(none)"} → ${dayaiDate}`
+      );
+      dueDateUpdated++;
+    } catch (err) {
+      console.error(`[A] ❌ Failed to update due_date for "${action.title}":`, err);
+    }
+  }
+
+  return { created, dueDateUpdated };
 }
 
 /**
  * Direction B: Todoist → DayAI
- * Find synced Actions with open status, check Todoist completion → COMPLETED
+ * Find synced Actions with open status, check Todoist completion → COMPLETED.
+ * For active Todoist tasks, pull due_date changes back to DayAI timeframeEnd.
  */
 async function syncTodoistToDayAI(
   client: DayAIClient,
   todoistToken: string,
   openActions: DayAIAction[]
-): Promise<number> {
+): Promise<{ completed: number; dueDateUpdated: number }> {
   const syncedActions = openActions.filter(
     (a) => extractTodoistId(a.description) !== null
   );
 
   if (syncedActions.length === 0) {
     console.log("[B] No synced open actions to check.");
-    return 0;
+    return { completed: 0, dueDateUpdated: 0 };
   }
 
   console.log(`[B] Checking ${syncedActions.length} synced action(s) for Todoist completion.`);
   let completed = 0;
+  let dueDateUpdated = 0;
 
   for (const action of syncedActions) {
     const taskId = extractTodoistId(action.description)!;
@@ -263,6 +323,17 @@ async function syncTodoistToDayAI(
         await completeAction(client, action.objectId);
         console.log(`[B] ✅ Completed: "${action.title}" (Todoist task ${taskId})`);
         completed++;
+      } else {
+        const todoistDate = dateOnly(task.due?.date);
+        const dayaiDate = dateOnly(action.timeframeEnd);
+        if (todoistDate !== null && todoistDate !== dayaiDate) {
+          const isoDate = `${todoistDate}T00:00:00.000Z`;
+          await updateActionDueDate(client, action.objectId, isoDate);
+          console.log(
+            `[B] 📅 Updated DayAI dueDate for "${action.title}": ${dayaiDate ?? "(none)"} → ${todoistDate}`
+          );
+          dueDateUpdated++;
+        }
       }
     } catch (err: any) {
       // Task might have been deleted in Todoist
@@ -274,7 +345,7 @@ async function syncTodoistToDayAI(
     }
   }
 
-  return completed;
+  return { completed, dueDateUpdated };
 }
 
 // --- Main ---
@@ -296,16 +367,18 @@ async function main() {
 
   // Direction A: DayAI → Todoist
   console.log("\n--- Direction A: DayAI → Todoist ---");
-  const syncedToTodoist = await syncDayAIToTodoist(client, todoistToken, openActions);
+  const aResult = await syncDayAIToTodoist(client, todoistToken, openActions);
 
   // Direction B: Todoist → DayAI
   console.log("\n--- Direction B: Todoist → DayAI ---");
-  const completedFromTodoist = await syncTodoistToDayAI(client, todoistToken, openActions);
+  const bResult = await syncTodoistToDayAI(client, todoistToken, openActions);
 
   // Summary
   console.log("\n=== Summary ===");
-  console.log(`Actions synced to Todoist: ${syncedToTodoist}`);
-  console.log(`Actions completed from Todoist: ${completedFromTodoist}`);
+  console.log(`Actions created in Todoist: ${aResult.created}`);
+  console.log(`Todoist due_dates updated (DayAI → Todoist): ${aResult.dueDateUpdated}`);
+  console.log(`Actions completed from Todoist: ${bResult.completed}`);
+  console.log(`DayAI dueDates updated (Todoist → DayAI): ${bResult.dueDateUpdated}`);
   console.log(`Finished at: ${new Date().toISOString()}`);
 }
 
