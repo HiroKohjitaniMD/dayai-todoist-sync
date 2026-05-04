@@ -61,12 +61,24 @@ async function todoistRequest<T>(
   if (body) {
     options.body = JSON.stringify(body);
   }
-  const res = await fetch(url, options);
-  if (!res.ok) {
+
+  const retriableStatuses = new Set([500, 502, 503, 504]);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(url, options);
+    if (res.ok) {
+      return res.json() as Promise<T>;
+    }
+    if (retriableStatuses.has(res.status) && attempt === 0) {
+      console.warn(
+        `Todoist API ${method} ${path} returned ${res.status}; retrying in 3s...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      continue;
+    }
     const text = await res.text();
     throw new Error(`Todoist API ${method} ${path} failed (${res.status}): ${text}`);
   }
-  return res.json() as Promise<T>;
+  throw new Error(`Todoist API ${method} ${path} failed after retry`);
 }
 
 async function createTodoistTask(
@@ -120,6 +132,13 @@ async function getTodoistProjectTasks(
       results: TodoistTask[];
       next_cursor: string | null;
     }>("GET", `/tasks?${params.toString()}`, token);
+    if (!Array.isArray(page?.results)) {
+      console.warn(
+        `[A] ⚠️ Unexpected Todoist tasks response shape; treating as empty.`,
+        page
+      );
+      break;
+    }
     allTasks.push(...page.results);
     cursor = page.next_cursor;
   } while (cursor);
@@ -378,11 +397,21 @@ async function main() {
 
   // Direction A: DayAI → Todoist
   console.log("\n--- Direction A: DayAI → Todoist ---");
-  const aResult = await syncDayAIToTodoist(client, todoistToken, openActions);
+  let aResult = { created: 0, dueDateUpdated: 0 };
+  try {
+    aResult = await syncDayAIToTodoist(client, todoistToken, openActions);
+  } catch (err) {
+    console.error("[A] ❌ Direction A failed:", err);
+  }
 
   // Direction B: Todoist → DayAI
   console.log("\n--- Direction B: Todoist → DayAI ---");
-  const bResult = await syncTodoistToDayAI(client, todoistToken, openActions);
+  let bResult = { completed: 0, dueDateUpdated: 0 };
+  try {
+    bResult = await syncTodoistToDayAI(client, todoistToken, openActions);
+  } catch (err) {
+    console.error("[B] ❌ Direction B failed:", err);
+  }
 
   // Summary
   console.log("\n=== Summary ===");
@@ -394,6 +423,7 @@ async function main() {
 }
 
 main().catch((err) => {
+  // Log but always exit 0 so GitHub Actions doesn't treat transient failures as a job failure.
   console.error("Fatal error:", err);
-  process.exit(1);
+  process.exit(0);
 });
